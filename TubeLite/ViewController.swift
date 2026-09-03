@@ -29,6 +29,12 @@ class ViewController: UIViewController {
     private var nativeUserPaused = false
     private var bgResumeTimer: Timer?
 
+    /// Autoplay queue — populated when a video is opened from a playlist.
+    /// Empty/-1 means "regular browsing", where we fall back to YouTube's
+    /// own up-next / related-video click on end.
+    private var playQueue: [PlaylistItem] = []
+    private var playQueueIndex: Int = -1
+
     // MARK: - Lifecycle
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -41,45 +47,11 @@ class ViewController: UIViewController {
         prepareWebViewAndLoad()
 
         NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(forceKeepPlaying),
-            name: .forceKeepPlaying,
-            object: nil
-        )
+            self, selector: #selector(forceKeepPlaying),
+            name: .forceKeepPlaying, object: nil)
         NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(appWillEnterForeground),
-            name: UIApplication.willEnterForegroundNotification,
-            object: nil
-        )
-        func setupRemoteCommandCenter() {
-            let cc = MPRemoteCommandCenter.shared()
-            cc.pauseCommand.isEnabled = true
-            cc.playCommand.isEnabled = true
-            cc.togglePlayPauseCommand.isEnabled = true
-
-            cc.pauseCommand.addTarget { [weak self] _ in
-                self?.nativeUserPaused = true
-                self?.webView?.evaluateJavaScript(
-                    "var v=document.querySelector('video'); if(v) v.pause();", completionHandler: nil)
-                return .success
-            }
-            cc.playCommand.addTarget { [weak self] _ in
-                self?.nativeUserPaused = false
-                self?.webView?.evaluateJavaScript(
-                    "var v=document.querySelector('video'); if(v) v.play();", completionHandler: nil)
-                return .success
-            }
-            cc.togglePlayPauseCommand.addTarget { [weak self] _ in
-                guard let self = self else { return .commandFailed }
-                self.nativeUserPaused.toggle()
-                let js = self.nativeUserPaused
-                    ? "var v=document.querySelector('video'); if(v) v.pause();"
-                    : "var v=document.querySelector('video'); if(v) v.play();"
-                self.webView?.evaluateJavaScript(js, completionHandler: nil)
-                return .success
-            }
-        }
+            self, selector: #selector(appWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification, object: nil)
     }
 
     override var preferredStatusBarStyle: UIStatusBarStyle {
@@ -102,6 +74,65 @@ class ViewController: UIViewController {
         } catch {
             print("Audio session error: \(error)")
         }
+    }
+
+    // MARK: - Lock-screen / Control Center integration
+    //
+    // iOS needs an active MPNowPlayingInfoCenter registration to reliably
+    // route lock-screen taps to THIS app's remote command targets. Without
+    // it, taps can silently go to WebKit's own internal media session
+    // instead, which is why pause looked broken before.
+    func setupRemoteCommandCenter() {
+        let cc = MPRemoteCommandCenter.shared()
+        cc.pauseCommand.isEnabled = true
+        cc.playCommand.isEnabled = true
+        cc.togglePlayPauseCommand.isEnabled = true
+        cc.nextTrackCommand.isEnabled = true
+        cc.previousTrackCommand.isEnabled = true
+
+        cc.pauseCommand.addTarget { [weak self] _ in
+            self?.nativeUserPaused = true
+            self?.updateNowPlaying(isPlaying: false)
+            self?.webView?.evaluateJavaScript(
+                "var v=document.querySelector('video'); if(v) v.pause();", completionHandler: nil)
+            return .success
+        }
+        cc.playCommand.addTarget { [weak self] _ in
+            self?.nativeUserPaused = false
+            self?.updateNowPlaying(isPlaying: true)
+            self?.webView?.evaluateJavaScript(
+                "var v=document.querySelector('video'); if(v) v.play();", completionHandler: nil)
+            return .success
+        }
+        cc.togglePlayPauseCommand.addTarget { [weak self] _ in
+            guard let self = self else { return .commandFailed }
+            self.nativeUserPaused.toggle()
+            self.updateNowPlaying(isPlaying: !self.nativeUserPaused)
+            let js = self.nativeUserPaused
+                ? "var v=document.querySelector('video'); if(v) v.pause();"
+                : "var v=document.querySelector('video'); if(v) v.play();"
+            self.webView?.evaluateJavaScript(js, completionHandler: nil)
+            return .success
+        }
+        cc.nextTrackCommand.addTarget { [weak self] _ in
+            self?.playNextInQueue()
+            return .success
+        }
+    }
+
+    /// Registers this app as the active Now Playing source and reflects
+    /// play/pause state so lock-screen controls behave correctly.
+    func updateNowPlaying(isPlaying: Bool, title: String? = nil) {
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+        if let title = title {
+            info[MPMediaItemPropertyTitle] = title
+        } else if info[MPMediaItemPropertyTitle] == nil {
+            info[MPMediaItemPropertyTitle] = "TubeLite"
+        }
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+        info[MPNowPlayingInfoPropertyIsLiveStream] = false
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
     }
 
     // MARK: - Background / Foreground control of force-play
@@ -144,7 +175,7 @@ class ViewController: UIViewController {
             })();
         """, completionHandler: nil)
     }
-    
+
     // MARK: - WebView (created only after ad-block rules are compiled)
     func prepareWebViewAndLoad() {
         let config = WKWebViewConfiguration()
@@ -172,7 +203,10 @@ class ViewController: UIViewController {
             }
         }
     }
-    
+
+    /// Reports genuine pause/play (gesture-gated for pause, since a
+    /// background stall also fires 'pause' with no tap behind it) and
+    /// video-ended events back to native via a custom URL scheme.
     func playbackStateReporterJS() -> String { """
     (function() {
         if (window.__ytStateReporterInstalled) return;
@@ -199,6 +233,9 @@ class ViewController: UIViewController {
             v.addEventListener('play', function() {
                 window.location.href = 'yttube://state?paused=0';
             });
+            v.addEventListener('ended', function() {
+                window.location.href = 'yttube://state?ended=1';
+            });
         }
 
         new MutationObserver(function() {
@@ -208,13 +245,51 @@ class ViewController: UIViewController {
         attach(document.querySelector('video'));
     })();
     """ }
-    
+
     func handleStateScheme(_ url: URL) {
         guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let val = comps.queryItems?.first(where: { $0.name == "paused" })?.value
+              let items = comps.queryItems
         else { return }
-        nativeUserPaused = (val == "1")
+
+        if let pausedVal = items.first(where: { $0.name == "paused" })?.value {
+            let paused = (pausedVal == "1")
+            nativeUserPaused = paused
+            updateNowPlaying(isPlaying: !paused)
+        }
+        if items.first(where: { $0.name == "ended" })?.value == "1" {
+            playNextInQueue()
+        }
     }
+
+    /// Autoplay: if we're playing through a saved playlist, load the next
+    /// item natively. Otherwise (regular browsing), ask the page to click
+    /// YouTube's own "up next" / autoplay element.
+    private func playNextInQueue() {
+        guard webView != nil else { return }
+        if playQueueIndex >= 0, playQueueIndex + 1 < playQueue.count {
+            playQueueIndex += 1
+            let next = playQueue[playQueueIndex]
+            guard let url = URL(string: next.url) else { return }
+            webView.load(URLRequest(url: url))
+            updateNowPlaying(isPlaying: true, title: next.title)
+        } else {
+            webView.evaluateJavaScript(clickNextVideoJS(), completionHandler: nil)
+        }
+    }
+
+    /// Best-effort: clicks YouTube's own next-video / autoplay-upnext
+    /// element. Selectors may need updates if YouTube changes its DOM.
+    func clickNextVideoJS() -> String { """
+    (function() {
+        var next = document.querySelector(
+            '.ytp-autonav-endscreen-upnext-thumbnail, .ytp-next-button, ' +
+            'ytm-compact-autoplay-renderer a, ytd-compact-autoplay-renderer a, ' +
+            '.ytp-suggested-video-overlay'
+        );
+        if (next) { next.click(); return true; }
+        return false;
+    })();
+    """ }
 
     func createWebView(with config: WKWebViewConfiguration) {
         webView = WKWebView(frame: .zero, configuration: config)
@@ -382,13 +457,21 @@ class ViewController: UIViewController {
     // MARK: - Navigation Actions
     @objc func goBack()    { if webView.canGoBack    { webView.goBack() } }
     @objc func goForward() { if webView.canGoForward { webView.goForward() } }
-    @objc func goHome()    { loadYouTube() }
+    @objc func goHome()    {
+        playQueue = []
+        playQueueIndex = -1
+        loadYouTube()
+    }
 
     @objc func goLibrary() {
         let vc = PlaylistViewController()
-        vc.onSelect = { [weak self] item in
-            guard let url = URL(string: item.url) else { return }
-            self?.webView.load(URLRequest(url: url))
+        vc.onSelectFromQueue = { [weak self] items, index in
+            guard let self = self, index >= 0, index < items.count,
+                  let url = URL(string: items[index].url) else { return }
+            self.playQueue = items
+            self.playQueueIndex = index
+            self.updateNowPlaying(isPlaying: true, title: items[index].title)
+            self.webView.load(URLRequest(url: url))
         }
         let nav = UINavigationController(rootViewController: vc)
         nav.modalPresentationStyle = .pageSheet
@@ -443,8 +526,26 @@ class ViewController: UIViewController {
                 PlaylistManager.shared.save(title: title, url: videoURL, thumb: thumb, toPlaylist: pl.id)
             })
         }
+        sheet.addAction(UIAlertAction(title: "New Playlist…", style: .default) { [weak self] _ in
+            self?.promptNewPlaylistThenSave(title: title, url: videoURL, thumb: thumb)
+        })
         sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         present(sheet, animated: true)
+    }
+
+    private func promptNewPlaylistThenSave(title: String, url: String, thumb: String?) {
+        let alert = UIAlertController(title: "New Playlist", message: nil, preferredStyle: .alert)
+        alert.addTextField { $0.placeholder = "Playlist name" }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Create & Save", style: .default) { [weak alert] _ in
+            guard let name = alert?.textFields?.first?.text,
+                  !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+            PlaylistManager.shared.createPlaylist(name: name)
+            if let newPl = PlaylistManager.shared.playlists.last {
+                PlaylistManager.shared.save(title: title, url: url, thumb: thumb, toPlaylist: newPl.id)
+            }
+        })
+        present(alert, animated: true)
     }
 
     // MARK: - Ad Blocking
@@ -715,31 +816,45 @@ class ViewController: UIViewController {
 
     /// Adds a "+ Save" button on watch pages that hands the video title,
     /// URL, and thumbnail back to native via a custom URL scheme.
+    ///
+    /// IMPORTANT: title/url/thumb are computed FRESH at click time (not
+    /// cached at injection time) — the old bug where saved videos showed
+    /// "YouTube" as the title happened because the title hadn't loaded
+    /// yet when the button was first created.
     func playlistSaveButtonJS() -> String { #"""
     (function() {
         if (window.__ytSaveBtnInstalled) return;
         window.__ytSaveBtnInstalled = true;
 
-        function tryInject() {
-            if (location.pathname.indexOf('/watch') !== 0 && location.pathname.indexOf('/shorts') !== 0) return;
-            if (document.getElementById('yt-native-save-btn')) return;
-
+        function currentInfo() {
+            var ogTitle = document.querySelector('meta[property="og:title"]');
             var titleEl = document.querySelector(
                 'h1.slim-video-information-title span, h1.slim-video-information-title, .slim-video-information-title, ytm-slim-video-metadata-renderer h2, ytd-watch-metadata h1 yt-formatted-string, h1'
             );
-            var title = (titleEl && titleEl.textContent.trim()) || document.title.replace(' - YouTube', '');
-            var url = location.href;
+            var title = (ogTitle && ogTitle.content && ogTitle.content.trim())
+                || (titleEl && titleEl.textContent.trim())
+                || document.title.replace(' - YouTube', '');
+            if (!title || title === 'YouTube') title = 'Untitled video';
 
+            var url = location.href;
             var vidMatch = url.match(/[?&]v=([^&]+)/) || location.pathname.match(/\/shorts\/([^/?]+)/);
             var videoId = vidMatch ? vidMatch[1] : null;
             var thumb = videoId ? ('https://i.ytimg.com/vi/' + videoId + '/mqdefault.jpg') : '';
+
+            return { title: title, url: url, thumb: thumb };
+        }
+
+        function tryInject() {
+            if (location.pathname.indexOf('/watch') !== 0 && location.pathname.indexOf('/shorts') !== 0) return;
+            if (document.getElementById('yt-native-save-btn')) return;
 
             var btn = document.createElement('button');
             btn.id = 'yt-native-save-btn';
             btn.textContent = '+ Save';
             btn.style.cssText = 'position:fixed;top:60px;left:12px;z-index:999999;background:#ff0000;color:white;border:none;border-radius:20px;padding:7px 14px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.4);';
             btn.addEventListener('click', function() {
-                var encoded = encodeURIComponent(JSON.stringify({ title: title, url: url, thumb: thumb }));
+                var info = currentInfo(); // fresh read right now, not stale
+                var encoded = encodeURIComponent(JSON.stringify(info));
                 window.location.href = 'yttube://save?data=' + encoded;
                 btn.textContent = 'Saved';
                 btn.style.background = '#333';
@@ -806,7 +921,6 @@ extension ViewController: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         webView.evaluateJavaScript(visibilityJS(), completionHandler: nil)
-        //webView.evaluateJavaScript(keepPlayingJS(), completionHandler: nil)
         let flag = isInBackground ? "true" : "false"
         webView.evaluateJavaScript("window.__ytForcePlay = \(flag);", completionHandler: nil)
         webView.evaluateJavaScript(adSkipJS(), completionHandler: nil)
